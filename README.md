@@ -1,8 +1,10 @@
 # Upload to S3 script
 
 Quick BASH script to upload a file or directory to S3 and get a URL. It creates part of a sha1sum of the file(s) for each upload, so that you can easily upload different files with the same filename, as well as make it difficult to guess other links (eg. /h3kdfe/Screenshot_002.png, /ang49df3/Screenshot_003.png).
+Depends on the AWS CLI.
 
-Depends on the AWS CLI 
+![Demo](demo.gif)
+
 
 ## Install steps
 
