@@ -1,0 +1,167 @@
+---
+# Assumes you have your base domain in Route53 already
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: uploads3 setup
+
+Parameters:
+    DomainName:
+        Description: Domain name to share your files, eg. files.yourdomain.com
+        Type: String
+        Default: files.rizvir.com
+
+    HostedZoneName:
+        Description: Domain name of your Route 53 Hosted Zone, eg. yourdomain.com
+        Type: String
+        Default: rizvir.com
+
+    CertificateARN:
+        Description: us-east-1 AWS Certificate Manager cert ARN
+        Type: String
+        Default: arn:aws:acm:us-east-1:678221166243:certificate/3b4bedd0-446b-4bca-bcdb-c2201e67cd4b
+
+    LogRetentionDays:
+        Description: How many days the logs should be kept for
+        Type: Number
+        Default: 600
+
+    VersionRetentionDays:
+        Description: How many days a previous version of an object should be kept for
+        Type: Number
+        Default: 15
+
+    CloudFrontTTL:
+        Description: TTL in seconds for CloudFront to cache objects for
+        Type: Number
+        Default: 86400 # 1 day, default
+
+Resources:
+
+    # Main bucket hosting the files
+    FilesBucket:
+        Type: AWS::S3::Bucket
+        Properties:
+            BucketName: !Ref DomainName
+            LifecycleConfiguration:
+                Rules:
+                    - NoncurrentVersionExpirationInDays: !Ref VersionRetentionDays
+                      Status: Enabled
+            VersioningConfiguration:
+                Status: Enabled
+
+
+    # CloudFront Access logs
+    FilesLogsBucket:
+        Type: AWS::S3::Bucket
+        Properties:
+            BucketName: !Sub ${DomainName}-access-logs
+            AccessControl: LogDeliveryWrite
+            LifecycleConfiguration:
+                Rules:
+                    - ExpirationInDays: !Ref LogRetentionDays
+                      Status: Enabled
+
+
+    # Limited user for the S3 upload script
+    ScriptUser:
+        Type: AWS::IAM::User
+        Properties:
+            Path: "/"
+            Policies:
+                - PolicyName: "S3Uploadscript"
+                  PolicyDocument:
+                    Version: 2012-10-17
+                    Statement:
+                        - Effect: Allow
+                          Action:
+                            - s3:GetObject
+                            - s3:GetObjectAcl
+                            - s3:PutObject
+                            - s3:PutObjectAcl
+                            - s3:PutObjectTagging
+                            - s3:ListBucket
+                          Resource:
+                           - !Sub "arn:aws:s3:::${FilesBucket}"
+                           - !Sub "arn:aws:s3:::${FilesBucket}/*"
+    ScriptUserKey:
+        Type: AWS::IAM::AccessKey
+        Properties:
+            UserName: !Ref ScriptUser
+
+
+    # CloudFront distribution
+    BucketCloudFront:
+        Type: AWS::CloudFront::Distribution
+        Properties:
+            DistributionConfig:
+                Enabled: true
+                DefaultRootObject: index.html
+                Logging:
+                    Bucket: !GetAtt FilesLogsBucket.DomainName
+                HttpVersion: http2
+                ViewerCertificate: 
+                    AcmCertificateArn: !Ref CertificateARN
+                    SslSupportMethod: sni-only
+                Aliases:
+                    - !Ref DomainName
+                Comment: !Sub ${DomainName} S3
+                DefaultCacheBehavior:
+                    ViewerProtocolPolicy: allow-all
+                    Compress: true
+                    AllowedMethods: ["HEAD", "GET"]
+                    DefaultTTL: !Ref CloudFrontTTL
+                    TargetOriginId: !Ref DomainName
+                    ForwardedValues:
+                        QueryString: true
+                        Cookies:
+                            Forward: none
+                Origins:
+                    # https://s3-ap-southeast-2.amazonaws.com/your.bucket.name
+                    # To access it via HTTPS, we need to use this URL
+                    # Mainly useful for presigned S3 URLs
+                    - DomainName: !Sub s3-${AWS::Region}.amazonaws.com
+                      OriginPath: !Sub /${FilesBucket}
+                      Id: !Ref DomainName
+                      CustomOriginConfig:
+                        HTTPSPort: 443
+                        OriginProtocolPolicy: https-only
+
+    # DNS entry
+    Route53DNSRecord:
+        Type: AWS::Route53::RecordSet
+        Properties:
+            Comment: "uploads3"
+            HostedZoneName: !Sub ${HostedZoneName}.
+            Name: !Ref DomainName
+            Type: A
+            AliasTarget:
+                DNSName: !GetAtt BucketCloudFront.DomainName
+                HostedZoneId: Z2FDTNDATAQYW2 # fixed AWS CloundFront service ID
+
+                        
+
+
+
+    
+            
+
+Outputs:
+    S3Bucket:
+        Description: S3 bucket name
+        Value: !Ref FilesBucket
+    
+    AccessLogs:
+        Description: Access logs bucket
+        Value: !Ref FilesLogsBucket
+
+    
+    ScriptUserAccessKey:
+        Description: Access key for the uploads3 script
+        Value: !Ref ScriptUserKey
+
+    ScriptUserSecretKey:
+        Description: Secret key for the uploads3 script
+        Value: !GetAtt ScriptUserKey.SecretAccessKey
+
+
+

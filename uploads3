@@ -1,0 +1,239 @@
+#!/bin/bash
+# Upload files to S3 bucket 
+
+config_file="$HOME/.uploads3.conf"
+
+if [ ! -f "$config_file" ]; then
+    echo "Expected config file in $config_file . Sample contents:
+      bucket=\"files.yoursite.com\"
+      aws_profile=\"uploads3\"
+      base_url=\"https://your.cloudfrontdistro.com\"
+      # or base_url=\"https://s3-ap-southeast-2.amazonaws.com/somebucket/\"
+    "
+    exit 3
+fi
+
+source "$config_file"
+set -o pipefail
+sha_length=7
+
+aws_params=""
+if [ -n "$aws_profile" ]; then
+    aws_params="$aws_params --profile $aws_profile"
+fi
+aws="aws $aws_params"
+
+function print_help() {
+    echo "Usage: `basename $0` [OPTION]... [FILE|DIRECTORY]...
+Uploads files or directories to an S3 bucket. Reads config file from ~/.uploads3.conf
+
+Optional arguments:
+    --zip           Zip file/directory before uploading
+    --expire        Generate link that expires after this many seconds
+
+Example:
+    `basename $0` somefile.jpg
+    `basename $0` --expire 600 privatefile.pdf 
+    `basename $0` somedirectory/
+
+"
+    exit 3
+}
+
+
+#####################
+# Argument handling #
+#####################
+
+while [[ $1 ]]; do
+    case "$1" in
+        -z | --zip)
+            zip=true
+            shift
+            ;;
+        -g | --gzip)
+            gzip=true
+            shift
+            ;;
+        -b | --bzip2)
+            bzip2=true
+            shift
+            ;;
+        -e | --expire)
+            expire="$2"
+            # Check if it's a number
+            if ! [[ $expire =~ ^[0-9]+$ ]]; then
+                echo "Unexpected argument to --expire: $expire"
+                print_help
+            fi
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        --*)
+            print_help
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+
+# Input: "Return-Code" "Message"
+# Exits if the return code is non-zero
+function check_status() {
+    local ret=$1
+    local message=$2
+    if [ $ret == 0 ]; then
+        # debug:
+        #echo "$MESSAGE OK"
+        :
+    else
+        echo "$MESSAGE failed!"
+        exit 1
+    fi
+}
+
+# Input: some/path
+# Output: Outputs URL in either the CLI or GUI
+function print_s3_url() { 
+    local s3path="$1"
+
+    # If "expire" wasn't set, just print the URL
+    if [[ -z "$expire" ]]; then
+        echo "$base_url/$s3path"
+        return
+    fi
+
+    # Otherwise presign the URL
+    echo $aws s3 presign --expires-in $expire s3://$bucket/$s3path
+    presign_url=$($aws s3 presign --expires-in $expire s3://$bucket/$s3path)
+    check_status $? "aws s3 presign"
+
+    echo "$presign_url"
+}
+
+# Input: filename
+# Output: URL of uploaded file
+function upload_file() {
+    local filepath="$1"
+    local filename=$(basename "$filepath")
+    local s3params=""
+
+    # Get first 7 digits of SHA1SUM of file
+    hash=$(sha1sum "$filepath" | cut -d ' ' -f 1 | head -c $sha_length)
+    
+    local s3path="$hash/$filename"
+    local url="$base_url/$s3path"
+
+    # First check if file already exists
+    $aws s3 ls "s3://$bucket/$s3path" > /dev/null
+    ret=$?
+    if [ $ret == 0 ]; then
+        # File already exists
+        # Get the current public read status
+        public_acl=$( $aws --output text s3api get-object-acl --bucket $bucket --key "$s3path" --query "Grants[] | [?Grantee.URI=='http://acs.amazonaws.com/groups/global/AllUsers'].Permission" )
+        check_status $? "aws s3api get-object-acl"
+
+        # If it's public, and --expire was not set OR if it's not public, and --expire was set
+        # Then there is nothing to do, just print the URL and exit
+        if [[ "$public_acl" == "READ" && -z "$expire" ]] ||
+            [[ "$public_acl" != "READ" && -n "$expire" ]]; then
+                echo "File already exists"
+                print_s3_url "$s3path"
+                exit 0
+        fi
+    elif [ $ret != 1 ]; then
+        echo "Unexpected return code from aws: $ret"
+        exit 1
+    fi
+
+    # Check filesize
+    kilobytes=$(du -k --apparent-size --dereference "$filepath" | cut -f 1)
+
+    # If the file size is more than 128KB, use S3 Infrequent Storage class
+    if [[ "$kilobytes" -ge 128 ]]; then
+        s3params="$s3params --storage-class STANDARD_IA"
+    fi
+    # If "expires" wasn't set, make it public
+    if [[ -z "$expire" ]]; then
+        s3params="$s3params --acl public-read"
+    fi
+    s3params="$s3params --follow-symlinks"
+
+    # Upload the file
+    $aws s3 cp $s3params "$filepath" "s3://$bucket/$s3path"
+    check_status $? "aws cp"
+
+    print_s3_url "$s3path"
+}
+
+
+# Input: directory
+# Output: URL of uploaded direcotry index
+function upload_directory() {
+    local dirpath="$1"
+    local dirname=$(basename "$filepath")
+    local s3params=""
+
+    # Calculate SHA1SUM by going through a sorted filelist
+    hash=$(find "$dirpath" -type f -exec sha1sum {} \; | sort | sha1sum | cut -d ' ' -f 1 | head -c $sha_length)
+    
+    local s3indexpath="$hash/index.html"
+
+    # First check if directory index already exists
+    $aws s3 ls "s3://$bucket/$s3indexpath" > /dev/null
+    ret=$?
+    if [ $ret == 0 ]; then
+        # Already exists
+        echo "Directory already exists"
+        print_s3_url "$s3indexpath"
+        exit 0
+    elif [ $ret != 1 ]; then
+        echo "Unexpected return code from aws: $ret"
+        exit 1
+    fi
+
+    s3params="$s3params --follow-symlinks"
+
+    # Sync directory
+    $aws s3 sync --acl public-read "$dirpath" "s3://$bucket/$hash/"
+    check_status $? "aws sync"
+
+    # Generate index
+    tree -l -h -C -F -H . "$dirpath" | $aws s3 cp --acl public-read --content-type text/html - "s3://$bucket/$hash/index.html"
+    check_status $? "tree generate index"
+
+    print_s3_url "$s3indexpath"
+
+}
+
+# Files to transfer are in $@ now
+
+# We handle things differently if it's a single file (which is simple), vs.
+# if it's a directory (which needs a directory index generated)
+# If it's zipped, it's a single file at the end.
+if [[ "$zip" = true || "$gzip" = true || "$bzip2" = true ]]; then
+    compressed=true
+fi
+
+# Check if it's a simple single file:
+if [[ "$#" == 1 ]] && [[ -f "$1" ]]; then
+    upload_file "$1" 
+    exit 0
+fi
+
+# If it's a single directory
+if [[ "$#" == 1 ]] && [[ -d "$1" ]]; then
+    upload_directory "$1" 
+    exit 0
+fi
+
+# If there are multiple files, create a temporary directory
+# and copy the soft links of the files/dirs into it, and then
+# run an s3 dir sync with --follow-symlinks
+
+# vim: ts=4:sw=4:expandtab
