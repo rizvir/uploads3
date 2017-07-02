@@ -8,17 +8,14 @@ Parameters:
     DomainName:
         Description: Domain name to share your files, eg. files.yourdomain.com
         Type: String
-        Default: files.rizvir.com
 
     HostedZoneName:
         Description: Domain name of your Route 53 Hosted Zone, eg. yourdomain.com
         Type: String
-        Default: rizvir.com
 
     CertificateARN:
         Description: us-east-1 AWS Certificate Manager cert ARN
         Type: String
-        Default: arn:aws:acm:us-east-1:678221166243:certificate/3b4bedd0-446b-4bca-bcdb-c2201e67cd4b
 
     LogRetentionDays:
         Description: How many days the logs should be kept for
